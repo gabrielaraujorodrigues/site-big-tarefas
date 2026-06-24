@@ -1,7 +1,35 @@
 import { chromium, type Browser, type Page } from "playwright-core";
+import { execSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { db, logsTable, surveysTable, automationRunsTable } from "@workspace/db";
 import { logger } from "./logger";
+
+function findChromiumExecutable(): string | undefined {
+  // 1. Try system chromium (installed via nix on Replit)
+  const candidates = [
+    "/run/current-system/sw/bin/chromium",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/google-chrome",
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+  // 2. Try `which chromium`
+  try {
+    const p = execSync("which chromium 2>/dev/null || which chromium-browser 2>/dev/null || which google-chrome-stable 2>/dev/null", { encoding: "utf8" }).trim().split("\n")[0];
+    if (p && existsSync(p)) return p;
+  } catch { /* ignore */ }
+  // 3. Try nix store path directly
+  try {
+    const nixPath = execSync("find /nix/store -name 'chromium' -type f -path '*/bin/chromium' 2>/dev/null | head -1", { encoding: "utf8" }).trim();
+    if (nixPath && existsSync(nixPath)) return nixPath;
+  } catch { /* ignore */ }
+  // 4. Let playwright use its own downloaded browser (may fail without system libs)
+  return undefined;
+}
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -211,14 +239,19 @@ async function runLoop(phone: string, password: string): Promise<void> {
     state.phase = "logging_in";
     await log("info", "Abrindo navegador...");
 
+    const executablePath = findChromiumExecutable();
+    logger.info({ executablePath: executablePath ?? "playwright-default" }, "launching browser");
+
     browser = await chromium.launch({
       headless: true,
+      executablePath,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
-        "--single-process",
+        "--no-zygote",
+        "--disable-extensions",
       ],
     });
 
@@ -230,11 +263,63 @@ async function runLoop(phone: string, password: string): Promise<void> {
 
     const page = await context.newPage();
 
+    // Discover login URL by starting from homepage
     await log("info", "Acessando bigpesquisa.com...");
-    await page.goto("https://bigpesquisa.com/app/login", {
-      waitUntil: "networkidle",
+    await page.goto("https://bigpesquisa.com", {
+      waitUntil: "domcontentloaded",
       timeout: 30000,
     });
+    await sleep(3000);
+
+    // Save screenshot of homepage for debugging
+    try {
+      await page.screenshot({ path: "/tmp/bigpesquisa-home.png", fullPage: false });
+    } catch { /* ignore */ }
+
+    const homeUrl = page.url();
+    await log("info", `Homepage carregada: ${homeUrl}`);
+
+    // Try to find and navigate to login page
+    const loginCandidates = [
+      "https://bigpesquisa.com/entrar",
+      "https://bigpesquisa.com/login",
+      "https://bigpesquisa.com/signin",
+      "https://bigpesquisa.com/auth",
+      "https://bigpesquisa.com/auth/login",
+    ];
+
+    // First try clicking a login button on homepage
+    const loginBtn = page.locator(
+      'a:has-text("Entrar"), a:has-text("Login"), a:has-text("Acessar"), a:has-text("Já tenho conta"), button:has-text("Entrar"), a[href*="login"], a[href*="entrar"], a[href*="signin"]'
+    ).first();
+
+    if ((await loginBtn.count()) > 0) {
+      const href = await loginBtn.getAttribute("href").catch(() => null);
+      await log("info", `Botao login encontrado, href: ${href ?? "(click)"}`);
+      await loginBtn.click();
+      await page.waitForLoadState("domcontentloaded").catch(() => {});
+      await sleep(3000);
+    } else {
+      // Try candidate URLs
+      let found = false;
+      for (const candidate of loginCandidates) {
+        await page.goto(candidate, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+        await sleep(2000);
+        const status = await page.evaluate(() => document.body.innerHTML.includes("404")).catch(() => true);
+        if (!status) {
+          await log("info", `Login URL encontrada: ${candidate}`);
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        await log("warn", "URL de login nao encontrada, tentando homepage como fallback");
+      }
+    }
+
+    await sleep(2000);
+    const loginUrl = page.url();
+    await log("info", `Pagina de login: ${loginUrl}`);
 
     await log("info", "Fazendo login com telefone...");
     await doLogin(page, phone, password);
@@ -302,62 +387,120 @@ async function shutdown(): Promise<void> {
 
 async function doLogin(page: Page, phone: string, password: string): Promise<void> {
   try {
-    // Wait for any input to appear
-    await page.waitForSelector("input", { timeout: 15000 }).catch(() => {});
+    // Wait up to 60s for ANY input to appear (SPA apps can be slow)
+    await log("info", "Aguardando pagina de login carregar...");
+    await page.waitForSelector("input, [data-testid], form", { timeout: 60000 }).catch(() => {});
+    await sleep(3000);
 
-    // Fill phone number
-    const phoneInput = page
-      .locator('input[type="tel"], input[placeholder*="telefone"], input[placeholder*="celular"], input[placeholder*="phone"], input[name*="phone"], input[name*="telefone"]')
-      .first();
+    // Debug: log the page URL and title
+    const url = page.url();
+    const title = await page.title().catch(() => "?");
+    await log("info", `Pagina: ${title} | URL: ${url}`);
 
-    const phoneCount = await phoneInput.count();
-    if (phoneCount > 0) {
-      await phoneInput.fill(phone);
-    } else {
-      // Fallback: first non-password input
-      await page.locator('input:not([type="password"]):not([type="hidden"])').first().fill(phone);
+    // Save screenshot and HTML for debugging
+    try {
+      const { writeFileSync } = await import("node:fs");
+      const html = await page.content();
+      writeFileSync("/tmp/bigpesquisa-login.html", html);
+      await page.screenshot({ path: "/tmp/bigpesquisa-login.png", fullPage: true });
+      await log("info", "Screenshot e HTML salvos em /tmp/");
+    } catch { /* ignore */ }
+
+    // Log visible elements for debugging
+    const elemSummary = await page.evaluate(() => {
+      const inputs = document.querySelectorAll("input, textarea, [contenteditable], [role='textbox'], ion-input, mat-input, [data-input]");
+      const forms = document.querySelectorAll("form");
+      return {
+        inputCount: inputs.length,
+        formCount: forms.length,
+        bodySnippet: document.body.innerHTML.slice(0, 500),
+      };
+    }).catch(() => ({ inputCount: -1, formCount: -1, bodySnippet: "error" }));
+    await log("info", `DOM: ${elemSummary.inputCount} inputs, ${elemSummary.formCount} forms | body: ${elemSummary.bodySnippet.slice(0, 200)}`);
+
+    // Try filling phone — ordered from most to least specific
+    let phoneFound = false;
+    const phoneSelectors = [
+      'input[type="tel"]',
+      'input[inputmode="tel"]',
+      'input[inputmode="numeric"]',
+      'input[placeholder*="telefone" i]',
+      'input[placeholder*="celular" i]',
+      'input[placeholder*="phone" i]',
+      'input[placeholder*="número" i]',
+      'input[placeholder*="numero" i]',
+      'input[name*="phone" i]',
+      'input[name*="telefone" i]',
+      'input[name*="mobile" i]',
+      'input[autocomplete="tel"]',
+      'input:not([type="password"]):not([type="hidden"]):not([type="email"]):not([type="checkbox"])',
+      'input[type="text"]',
+      'input',
+    ];
+
+    for (const sel of phoneSelectors) {
+      const count = await page.locator(sel).count();
+      if (count > 0) {
+        await page.locator(sel).first().fill(phone);
+        phoneFound = true;
+        await log("info", `Campo telefone encontrado com: ${sel}`);
+        break;
+      }
     }
 
-    await log("info", "Numero de telefone inserido");
-    await sleep(500);
+    if (!phoneFound) {
+      throw new Error("Campo de telefone nao encontrado na pagina");
+    }
 
-    // Check if there's a "next" step before password (some flows are multi-step)
-    const hasNextBtn = await page
-      .locator('button:has-text("Continuar"), button:has-text("Proximo"), button:has-text("Next")')
-      .count();
+    await sleep(600);
 
-    if (hasNextBtn > 0) {
-      await page
-        .locator('button:has-text("Continuar"), button:has-text("Proximo"), button:has-text("Next")')
-        .first()
-        .click();
-      await sleep(2000);
+    // Advance to password step if multi-step form
+    const nextBtn = page.locator(
+      'button:has-text("Continuar"), button:has-text("Próximo"), button:has-text("Proximo"), button:has-text("Next"), button:has-text("Avançar")',
+    ).first();
+    if ((await nextBtn.count()) > 0) {
+      await nextBtn.click();
+      await sleep(2500);
+      await log("info", "Avancado para etapa de senha");
     }
 
     // Fill password
     const pwInput = page.locator('input[type="password"]').first();
-    const pwCount = await pwInput.count();
-    if (pwCount > 0) {
+    if ((await pwInput.count()) > 0) {
       await pwInput.fill(password);
       await log("info", "Senha inserida");
-      await sleep(300);
+      await sleep(400);
     }
 
-    // Click login/submit
-    const submitBtn = page.locator(
-      'button[type="submit"], button:has-text("Entrar"), button:has-text("Login"), button:has-text("Acessar"), button:has-text("Confirmar")',
-    ).first();
-
-    const submitCount = await submitBtn.count();
-    if (submitCount > 0) {
-      await submitBtn.click();
-    } else {
+    // Click submit
+    const submitSelectors = [
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button:has-text("Entrar")',
+      'button:has-text("Login")',
+      'button:has-text("Acessar")',
+      'button:has-text("Confirmar")',
+      'button:has-text("Continuar")',
+    ];
+    let submitted = false;
+    for (const sel of submitSelectors) {
+      const btn = page.locator(sel).first();
+      if ((await btn.count()) > 0) {
+        await btn.click();
+        submitted = true;
+        await log("info", `Formulario enviado com: ${sel}`);
+        break;
+      }
+    }
+    if (!submitted) {
       await page.keyboard.press("Enter");
+      await log("info", "Formulario enviado via Enter");
     }
 
-    await page.waitForNavigation({ waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
-    await sleep(2000);
-    await log("success", "Login realizado com sucesso");
+    // Wait for navigation/redirect after login
+    await page.waitForTimeout(5000);
+    const postUrl = page.url();
+    await log("success", `Login concluido | URL: ${postUrl}`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(`Falha no login: ${msg}`);
