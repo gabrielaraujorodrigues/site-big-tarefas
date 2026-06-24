@@ -1,0 +1,201 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: API specification for BigPesquisa automation bot
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: automation
+    description: Survey automation control and monitoring
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /automation/status:
+    get:
+      operationId: getAutomationStatus
+      tags: [automation]
+      summary: Get automation status
+      description: Returns the current state of the automation bot
+      responses:
+        "200":
+          description: Current automation status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AutomationStatus"
+
+  /automation/start:
+    post:
+      operationId: startAutomation
+      tags: [automation]
+      summary: Start the automation bot
+      description: Launches the Playwright bot to log in and complete surveys
+      responses:
+        "200":
+          description: Bot started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AutomationStatus"
+
+  /automation/stop:
+    post:
+      operationId: stopAutomation
+      tags: [automation]
+      summary: Stop the automation bot
+      description: Gracefully stops the running bot
+      responses:
+        "200":
+          description: Bot stopped
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AutomationStatus"
+
+  /automation/logs:
+    get:
+      operationId: getAutomationLogs
+      tags: [automation]
+      summary: Get automation activity logs
+      description: Returns recent log entries from the bot
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        "200":
+          description: List of log entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LogEntry"
+
+  /automation/surveys:
+    get:
+      operationId: getAutomationSurveys
+      tags: [automation]
+      summary: Get completed surveys
+      description: Returns a list of all surveys the bot has completed
+      responses:
+        "200":
+          description: List of surveys
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Survey"
+
+  /automation/stats:
+    get:
+      operationId: getAutomationStats
+      tags: [automation]
+      summary: Get automation statistics
+      description: Returns aggregate stats - total points, surveys done, success rate
+      responses:
+        "200":
+          description: Aggregate stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AutomationStats"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    AutomationStatus:
+      type: object
+      required: [running, phase, pointsEarned, surveysCompleted, startedAt]
+      properties:
+        running:
+          type: boolean
+        phase:
+          type: string
+          description: "idle | logging_in | browsing | answering | claiming | error"
+        pointsEarned:
+          type: integer
+        surveysCompleted:
+          type: integer
+        startedAt:
+          type: ["string", "null"]
+        lastError:
+          type: ["string", "null"]
+
+    LogEntry:
+      type: object
+      required: [id, timestamp, level, message]
+      properties:
+        id:
+          type: integer
+        timestamp:
+          type: string
+        level:
+          type: string
+          description: "info | success | warn | error"
+        message:
+          type: string
+        detail:
+          type: ["string", "null"]
+
+    Survey:
+      type: object
+      required: [id, title, points, status, completedAt]
+      properties:
+        id:
+          type: integer
+        title:
+          type: string
+        points:
+          type: integer
+        status:
+          type: string
+          description: "completed | failed | skipped"
+        completedAt:
+          type: string
+        durationSeconds:
+          type: ["integer", "null"]
+
+    AutomationStats:
+      type: object
+      required: [totalPointsEarned, totalSurveysCompleted, totalSurveysFailed, successRate, totalRuns]
+      properties:
+        totalPointsEarned:
+          type: integer
+        totalSurveysCompleted:
+          type: integer
+        totalSurveysFailed:
+          type: integer
+        successRate:
+          type: number
+        totalRuns:
+          type: integer
+        lastRunAt:
+          type: ["string", "null"]
