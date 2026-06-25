@@ -980,8 +980,8 @@ async function answerCurrentQuestion(page: Page): Promise<"answered" | "done" | 
         const texts = els
           .map((e) => e.textContent?.trim() ?? "")
           .filter((t) => t.length > 1 && t.length < 150 && !isNavBtn(t));
-        // Must have at least 2 options and no more than 10
-        if (texts.length >= 2 && texts.length <= 10) {
+        // Accept 1-10 options (single-button screens like intro "Vamos lá!")
+        if (texts.length >= 1 && texts.length <= 10) {
           return { isDone: false, questionText, options: texts, type: "clickable:" + sel, optionEls: [] };
         }
       }
