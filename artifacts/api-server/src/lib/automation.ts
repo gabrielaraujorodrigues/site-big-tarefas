@@ -321,6 +321,25 @@ async function runLoop(phone: string, password: string): Promise<void> {
     const loginUrl = page.url();
     await log("info", `Pagina de login: ${loginUrl}`);
 
+    // Check if CloudFront blocked us before even trying login
+    const loginPageBlocked = await page.evaluate(() => {
+      const t = document.body.innerText ?? "";
+      return t.includes("403") || t.includes("Request blocked") || t.includes("Too Many");
+    }).catch(() => false);
+
+    if (loginPageBlocked) {
+      await log("warn", "Pagina de login bloqueada (403/429) — aguardando 60s antes de tentar novamente");
+      await sleep(60000);
+      // Retry loading the login page
+      await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+      await sleep(5000);
+      const stillBlocked = await page.evaluate(() => {
+        const t = document.body.innerText ?? "";
+        return t.includes("403") || t.includes("Request blocked");
+      }).catch(() => false);
+      if (stillBlocked) throw new Error("Bloqueio CloudFront persistente. Tente novamente em alguns minutos.");
+    }
+
     await log("info", "Fazendo login com telefone...");
     await doLogin(page, phone, password);
 
@@ -356,7 +375,14 @@ async function runLoop(phone: string, password: string): Promise<void> {
 
       for (const survey of surveys) {
         if (stopRequested) break;
+        // Skip surveys with no valid href
+        if (!survey.href) {
+          await log("warn", `Pulando "${survey.title}" (sem href)`);
+          continue;
+        }
         await completeSurvey(page, survey);
+        // Delay between surveys to avoid rate limiting (429)
+        if (!stopRequested) await sleep(8000);
       }
     }
 
@@ -513,57 +539,107 @@ interface SurveyItem {
   title: string;
   points: number;
   index: number;
+  href: string; // direct URL to navigate — avoids overlay/click issues
 }
 
 async function detectSurveys(page: Page): Promise<SurveyItem[]> {
   try {
     const currentUrl = page.url();
     if (!currentUrl.includes("bigpesquisa.com/app")) {
-      await page.goto("https://bigpesquisa.com/app", { waitUntil: "networkidle", timeout: 20000 });
+      await page.goto("https://bigpesquisa.com/app", { waitUntil: "domcontentloaded", timeout: 20000 });
     }
-    await sleep(2000);
+
+    // Wait for the fade-in animation overlay to disappear
+    await page.waitForSelector("div.animate-fade-in", { state: "detached", timeout: 8000 }).catch(() => {});
+
+    // Wait until "Carregando..." is gone (SPA async loading)
+    await page.waitForFunction(() => !document.body.innerText.includes("Carregando"), { timeout: 15000 }).catch(() => {});
+    await sleep(3000);
+
+    // Dump page HTML for debugging on first run
+    try {
+      const { writeFileSync } = await import("node:fs");
+      const html = await page.content();
+      writeFileSync("/tmp/bigpesquisa-app.html", html);
+      await page.screenshot({ path: "/tmp/bigpesquisa-app.png", fullPage: true });
+      await log("info", `App HTML salvo (${html.length} bytes)`);
+    } catch { /* ignore */ }
 
     return await page.evaluate(() => {
-      const results: Array<{ title: string; points: number; index: number }> = [];
+      const results: Array<{ title: string; points: number; index: number; href: string }> = [];
       const seen = new Set<string>();
+      const base = "https://bigpesquisa.com";
 
-      // Try many selectors to find survey cards
-      const candidates = Array.from(
-        document.querySelectorAll(
-          "[class*='survey'], [class*='pesquisa'], [class*='research'], [class*='card'], [class*='item'], li, article",
-        ),
-      );
+      // Strategy 1: find <a> tags whose href points to a survey/pesquisa URL
+      const allLinks = Array.from(document.querySelectorAll("a[href]"));
+      for (let i = 0; i < allLinks.length; i++) {
+        const a = allLinks[i] as HTMLAnchorElement;
+        const href = a.getAttribute("href") ?? "";
+        const fullHref = href.startsWith("http") ? href : base + href;
+        const text = a.textContent?.trim() ?? "";
 
-      for (let i = 0; i < candidates.length; i++) {
-        const el = candidates[i];
-        if (!el) continue;
-        const text = el.textContent?.trim() ?? "";
+        // Only accept bigpesquisa.com URLs — no external links (instagram, etc.)
+        const isInternal =
+          href.startsWith("/") ||
+          fullHref.startsWith("https://bigpesquisa.com") ||
+          fullHref.startsWith("http://bigpesquisa.com");
+        if (!isInternal) continue;
 
-        // Skip tiny elements
-        if (text.length < 5) continue;
+        // Skip navigation links (home, login, etc.)
+        if (href === "/" || href === "/app" || href === "/app/" || href.includes("login") || href.includes("entrar")) continue;
+        if (text.length < 3) continue;
 
-        // Must contain point indicators
-        const hasPoints =
-          text.includes("BigPonto") ||
-          text.includes("+") ||
-          /\d+\s*(pontos?|pts)/i.test(text);
-        if (!hasPoints) continue;
+        // Must be under /app/ sub-route (not the app root itself)
+        const isSurveyLink = href.startsWith("/app/") && href !== "/app/" && href !== "/app";
+        if (!isSurveyLink) continue;
 
-        // Extract title (first heading-like text)
-        const titleEl = el.querySelector("h1, h2, h3, h4, p, strong, span");
-        const title = titleEl?.textContent?.trim() ?? `Pesquisa ${i + 1}`;
+        const fullText = a.closest("section, article, li, div[class*='card'], div[class*='item']")?.textContent?.trim() ?? text;
 
-        if (seen.has(title)) continue;
-        seen.add(title);
-
-        // Extract points
-        const pointsMatch = text.match(/\+?\s*(\d+)\s*(?:BigPontos?|pontos?|pts)/i);
+        // Extract points from surrounding container
+        const pointsMatch = fullText.match(/\+?\s*(\d+)\s*(?:BigPontos?|pontos?|pts)/i);
         const points = pointsMatch ? parseInt(pointsMatch[1], 10) : 0;
 
-        results.push({ title, points, index: i });
+        // Extract best title: prefer heading inside card, fallback to link text
+        const container = a.closest("section, article, li, div[class*='card'], div[class*='item']");
+        const headingEl = container?.querySelector("h1,h2,h3,h4,strong,p");
+        const title = (headingEl?.textContent?.trim() || text).slice(0, 80);
+
+        if (seen.has(fullHref)) continue;
+        seen.add(fullHref);
+
+        results.push({ title, points, index: i, href: fullHref });
       }
 
-      return results.slice(0, 10); // max 10 surveys per run
+      // Strategy 2: if no links found, look for survey cards with BigPonto mentions
+      if (results.length === 0) {
+        const cards = Array.from(document.querySelectorAll(
+          "article, li[class], div[class*='card'], div[class*='survey'], div[class*='pesquisa'], section"
+        ));
+        for (let i = 0; i < cards.length; i++) {
+          const card = cards[i];
+          const text = card.textContent?.trim() ?? "";
+          if (text.length < 5) continue;
+          const hasPoints = text.includes("BigPonto") || /\d+\s*(pontos?|pts)/i.test(text);
+          if (!hasPoints) continue;
+
+          // Find clickable link inside card
+          const innerLink = card.querySelector("a[href]") as HTMLAnchorElement | null;
+          const href = innerLink?.getAttribute("href") ?? "";
+          const fullHref = href.startsWith("http") ? href : href ? base + href : "";
+
+          const pointsMatch = text.match(/\+?\s*(\d+)\s*(?:BigPontos?|pontos?|pts)/i);
+          const points = pointsMatch ? parseInt(pointsMatch[1], 10) : 0;
+
+          const headingEl = card.querySelector("h1,h2,h3,h4,strong,p");
+          const title = (headingEl?.textContent?.trim() ?? `Pesquisa ${i + 1}`).slice(0, 80);
+
+          if (seen.has(title)) continue;
+          seen.add(title);
+          results.push({ title, points, index: i, href: fullHref });
+        }
+      }
+
+      return results.slice(0, 10);
     });
   } catch {
     return [];
@@ -578,59 +654,118 @@ async function completeSurvey(page: Page, survey: SurveyItem): Promise<void> {
   await log("info", `Iniciando pesquisa: "${survey.title}" (+${survey.points} pts)`);
 
   try {
-    // Click the survey card
-    const clicked = await page.evaluate((title) => {
-      const all = Array.from(document.querySelectorAll("a, button, [role='button'], li, div, article"));
-      const el = all.find((e) => {
-        const t = e.textContent?.trim() ?? "";
-        return t.includes(title) && t.length < title.length + 200;
-      });
-      if (el) {
-        (el as HTMLElement).click();
-        return true;
-      }
-      return false;
-    }, survey.title);
+    const context = page.context();
 
-    if (!clicked) {
-      await log("warn", `Nao foi possivel clicar na pesquisa: "${survey.title}"`);
+    // Navigate directly to survey URL (avoids overlay/animation click issues)
+    if (!survey.href) {
+      await log("warn", `Sem href para: "${survey.title}" — pulando`);
       return;
     }
 
-    await page.waitForNavigation({ waitUntil: "networkidle", timeout: 15000 }).catch(() => {});
+    await log("info", `Navegando para: ${survey.href}`);
+
+    let activePage: Page = page;
+
+    // Some survey links open in a new tab — listen before navigating
+    const newPagePromise = context.waitForEvent("page", { timeout: 6000 }).catch(() => null);
+
+    await page.goto(survey.href, { waitUntil: "domcontentloaded", timeout: 25000 }).catch(async () => {
+      // If goto fails, it may have opened in new tab
+    });
+
     await sleep(2000);
+
+    // Check if a new tab opened instead
+    const newPage = await newPagePromise;
+    if (newPage && !newPage.isClosed()) {
+      await newPage.waitForLoadState("domcontentloaded").catch(() => {});
+      await sleep(2000);
+      await log("info", `Nova aba aberta: ${newPage.url()}`);
+      activePage = newPage;
+    }
+
+    const urlAfter = activePage.url();
+    await log("info", `URL pesquisa: ${urlAfter}`);
+
+    // Screenshot and DOM dump after clicking survey
+    try {
+      const { writeFileSync } = await import("node:fs");
+      await activePage.screenshot({ path: "/tmp/bigpesquisa-survey.png", fullPage: false });
+      const bodySnippet = await activePage.evaluate(() => document.body.innerHTML.slice(0, 1000)).catch(() => "err");
+      writeFileSync("/tmp/bigpesquisa-survey-body.txt", bodySnippet);
+      await log("info", `DOM pesquisa: ${bodySnippet.slice(0, 300)}`);
+    } catch { /* ignore */ }
+
+    // If we got rate-limited or blocked, wait and skip
+    const pageStatus = await activePage.evaluate(() => {
+      const t = document.body.innerText ?? "";
+      if (t.includes("429") || t.includes("Too Many") || t.includes("403") || t.includes("blocked")) return "blocked";
+      return "ok";
+    }).catch(() => "ok");
+
+    if (pageStatus === "blocked") {
+      await log("warn", `Pesquisa "${survey.title}" bloqueada (429/403) — aguardando 30s`);
+      await sleep(30000);
+      return;
+    }
+
+    // Check for iframe that contains the survey
+    const iframeEl = activePage.frameLocator("iframe").first();
+    const hasIframe = await activePage.locator("iframe").count() > 0;
+    if (hasIframe) {
+      await log("info", "Survey em iframe detectado");
+    }
 
     // Answer all questions
     let questionCount = 0;
-    const MAX_QUESTIONS = 60;
+    const MAX_QUESTIONS = 80;
     let consecutiveNoQuestion = 0;
+    let reallyDone = false;
 
     while (questionCount < MAX_QUESTIONS && !stopRequested) {
-      const result = await answerCurrentQuestion(page);
+      const result = await answerCurrentQuestion(activePage);
 
       if (result === "done") {
+        reallyDone = true;
         state.phase = "claiming";
-        await log("success", `Pesquisa "${survey.title}" concluida! Resgatando pontos...`);
+        await log("success", `Pesquisa "${survey.title}" concluida com ${questionCount} respostas!`);
         await sleep(3000);
         break;
       }
 
       if (result === "no_question") {
         consecutiveNoQuestion++;
-        if (consecutiveNoQuestion >= 3) {
-          // Check URL for completion signals
-          const url = page.url();
+
+        // Take a screenshot after first miss to understand the state
+        if (consecutiveNoQuestion === 1) {
+          try {
+            await activePage.screenshot({ path: "/tmp/bigpesquisa-noquestion.png", fullPage: false });
+            const snippet = await activePage.evaluate(() => ({
+              url: location.href,
+              title: document.title,
+              body: document.body.textContent?.slice(0, 400) ?? "",
+              html: document.body.innerHTML.slice(0, 600),
+            })).catch(() => ({ url: "", title: "", body: "", html: "" }));
+            await log("warn", `Sem pergunta | URL: ${snippet.url} | texto: ${snippet.body.slice(0, 200)}`);
+          } catch { /* ignore */ }
+        }
+
+        if (consecutiveNoQuestion >= 4) {
+          const url = activePage.url();
           if (
             url.includes("conclu") ||
             url.includes("obrigado") ||
             url.includes("finish") ||
             url.includes("complet") ||
-            url.includes("encerr")
+            url.includes("encerr") ||
+            url.includes("sucesso") ||
+            url.includes("thank")
           ) {
-            await log("success", `Pesquisa "${survey.title}" finalizada`);
+            reallyDone = true;
+            await log("success", `Pesquisa "${survey.title}" finalizada (URL conclusao)`);
             break;
           }
-          await log("warn", "Sem perguntas detectadas. Encerrando pesquisa.");
+          await log("warn", `Sem perguntas detectadas apos ${questionCount} respostas. Desistindo.`);
           break;
         }
         await sleep(2000);
@@ -642,21 +777,36 @@ async function completeSurvey(page: Page, survey: SurveyItem): Promise<void> {
       await sleep(800);
     }
 
+    // Close new tab if opened
+    if (newPage && !newPage.isClosed()) {
+      await newPage.close().catch(() => {});
+    }
+
     const duration = Math.round((Date.now() - start) / 1000);
-    state.surveysCompleted++;
-    state.pointsEarned += survey.points;
 
-    await db.insert(surveysTable).values({
-      title: survey.title,
-      points: survey.points,
-      status: "completed",
-      durationSeconds: duration,
-    });
-
-    await log("success", `Concluida em ${duration}s | Total: ${state.pointsEarned} pontos`);
+    // Only count as truly completed if questions were answered or done signal received
+    if (questionCount > 0 || reallyDone) {
+      state.surveysCompleted++;
+      state.pointsEarned += survey.points;
+      await db.insert(surveysTable).values({
+        title: survey.title,
+        points: survey.points,
+        status: "completed",
+        durationSeconds: duration,
+      });
+      await log("success", `Concluida: ${questionCount} perguntas em ${duration}s | Total: ${state.pointsEarned} pts`);
+    } else {
+      await db.insert(surveysTable).values({
+        title: survey.title,
+        points: 0,
+        status: "failed",
+        durationSeconds: duration,
+      });
+      await log("warn", `Pesquisa "${survey.title}" nao respondida (0 perguntas detectadas)`);
+    }
 
     // Return to survey list
-    await page.goto("https://bigpesquisa.com/app", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
+    await page.goto("https://bigpesquisa.com/app", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
     await sleep(2000);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -670,7 +820,7 @@ async function completeSurvey(page: Page, survey: SurveyItem): Promise<void> {
     }).catch(() => {});
 
     await page
-      .goto("https://bigpesquisa.com/app", { waitUntil: "networkidle", timeout: 20000 })
+      .goto("https://bigpesquisa.com/app", { waitUntil: "domcontentloaded", timeout: 20000 })
       .catch(() => {});
   }
 }
@@ -678,116 +828,177 @@ async function completeSurvey(page: Page, survey: SurveyItem): Promise<void> {
 async function answerCurrentQuestion(page: Page): Promise<"answered" | "done" | "no_question"> {
   try {
     const data = await page.evaluate(() => {
-      // Check for done signals
       const bodyText = document.body.textContent ?? "";
-      const isDone =
-        bodyText.includes("Obrigado") ||
-        bodyText.includes("obrigado") ||
-        bodyText.includes("Parabens") ||
-        bodyText.includes("concluida") ||
-        bodyText.includes("finalizada") ||
-        bodyText.includes("Completed") ||
-        bodyText.includes("encerrada");
 
-      if (isDone) return { isDone: true, questionText: "", options: [], type: "done" };
+      // ── Done signals ────────────────────────────────────────────────────────
+      const doneWords = ["obrigado", "parabéns", "parabens", "concluída", "concluida",
+        "finalizada", "completed", "encerrada", "sucesso", "thank you", "você ganhou",
+        "voce ganhou", "pontos adicionados", "resgatado"];
+      const isDone = doneWords.some((w) => bodyText.toLowerCase().includes(w));
+      if (isDone) return { isDone: true, questionText: "", options: [], type: "done", optionEls: [] };
 
-      // Find question text
+      // ── Question text ───────────────────────────────────────────────────────
       let questionText = "";
-      for (const sel of ["legend", "h1", "h2", "h3", "[class*='question']", "[class*='pergunta']", "label.title", "p.question"]) {
-        const el = document.querySelector(sel);
-        const t = el?.textContent?.trim() ?? "";
-        if (t.length > 8) { questionText = t; break; }
+      const questionSelectors = [
+        "legend", "h1", "h2", "h3", "h4",
+        "[class*='question']", "[class*='pergunta']", "[class*='titulo']",
+        "[class*='title']", "[class*='prompt']", "[class*='enunciado']",
+        "p[class*='text']", "span[class*='question']",
+        "label.title", "p.question",
+        // broad fallback: first <p> or <span> with a question mark or long text
+        "p", "span",
+      ];
+      for (const sel of questionSelectors) {
+        const els = Array.from(document.querySelectorAll(sel));
+        for (const el of els) {
+          const t = el.textContent?.trim() ?? "";
+          if (t.length > 10 && t.length < 400) {
+            questionText = t;
+            break;
+          }
+        }
+        if (questionText) break;
       }
 
-      if (!questionText) return { isDone: false, questionText: "", options: [], type: "none" };
+      if (!questionText) return { isDone: false, questionText: "", options: [], type: "none", optionEls: [] };
 
-      // Find radio/checkbox options
+      // ── Radio / Checkbox ────────────────────────────────────────────────────
       const radios = Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"]'));
-      const radioOptions = radios.map((r) => {
-        const label =
-          r.closest("label") ??
-          document.querySelector(`label[for="${(r as HTMLInputElement).id}"]`);
-        return label?.textContent?.trim() ?? (r as HTMLInputElement).value ?? "";
-      }).filter(Boolean);
+      if (radios.length > 0) {
+        const radioOptions = radios.map((r) => {
+          const label =
+            r.closest("label") ??
+            document.querySelector(`label[for="${(r as HTMLInputElement).id}"]`) ??
+            r.parentElement;
+          return label?.textContent?.trim() ?? (r as HTMLInputElement).value ?? "";
+        }).filter(Boolean);
+        return { isDone: false, questionText, options: radioOptions, type: "radio", optionEls: [] };
+      }
 
-      if (radioOptions.length > 0) return { isDone: false, questionText, options: radioOptions, type: "radio" };
-
-      // Select dropdown
+      // ── Select ──────────────────────────────────────────────────────────────
       const select = document.querySelector("select");
       if (select) {
         const selectOptions = Array.from(select.options)
           .filter((o) => o.value !== "")
           .map((o) => o.textContent?.trim() ?? "");
-        return { isDone: false, questionText, options: selectOptions, type: "select" };
+        return { isDone: false, questionText, options: selectOptions, type: "select", optionEls: [] };
       }
 
-      // Text input
-      const textInput = document.querySelector('input[type="text"], input[type="number"], textarea');
-      if (textInput) return { isDone: false, questionText, options: [], type: "text" };
+      // ── Styled button/div options (common in mobile survey apps) ────────────
+      // Look for a list of clickable options that aren't navigation buttons
+      const clickableGroups = [
+        '[class*="option"]', '[class*="choice"]', '[class*="alternativa"]',
+        '[class*="answer"]', '[class*="resposta"]', '[class*="item"]',
+        'li[class]', 'div[role="option"]', 'div[role="radio"]',
+        'button:not([type="submit"]):not([class*="next"]):not([class*="avanc"])',
+      ];
+      for (const sel of clickableGroups) {
+        const els = Array.from(document.querySelectorAll(sel));
+        const texts = els.map((e) => e.textContent?.trim() ?? "").filter((t) => t.length > 0 && t.length < 150);
+        // Must have at least 2 options and no more than 10
+        if (texts.length >= 2 && texts.length <= 10) {
+          return { isDone: false, questionText, options: texts, type: "clickable:" + sel, optionEls: [] };
+        }
+      }
 
-      return { isDone: false, questionText, options: [], type: "none" };
+      // ── Scale buttons (1-5, 1-10, NPS, stars) ──────────────────────────────
+      const allButtons = Array.from(document.querySelectorAll("button"));
+      const scaleButtons = allButtons.filter((b) => /^\d+$/.test(b.textContent?.trim() ?? ""));
+      if (scaleButtons.length >= 3) {
+        const nums = scaleButtons.map((b) => parseInt(b.textContent?.trim() ?? "0", 10));
+        return { isDone: false, questionText, options: nums.map(String), type: "scale-btn", optionEls: [] };
+      }
+
+      // ── Text input ──────────────────────────────────────────────────────────
+      const textInput = document.querySelector('input[type="text"], input[type="number"], textarea');
+      if (textInput) return { isDone: false, questionText, options: [], type: "text", optionEls: [] };
+
+      return { isDone: false, questionText: "", options: [], type: "none", optionEls: [] };
     });
 
     if (data.isDone) return "done";
     if (data.type === "none" || !data.questionText) return "no_question";
 
+    const q = data.questionText;
+    await log("info", `Pergunta: "${q.slice(0, 60)}" | tipo: ${data.type} | opcoes: ${data.options.length}`);
+
+    // ── Answer by type ───────────────────────────────────────────────────────
     if (data.type === "text") {
-      const answer = getTextAnswer(data.questionText);
-      const input = page.locator('input[type="text"], input[type="number"], textarea').first();
-      await input.fill(answer);
-      await log("info", `Resposta (texto): "${data.questionText.slice(0, 40)}..." -> "${answer}"`);
-    } else if (data.type === "radio" || data.type === "select") {
-      const chosenIdx = pickBestOption(data.questionText, data.options);
+      const answer = getTextAnswer(q);
+      await page.locator('input[type="text"], input[type="number"], textarea').first().fill(answer);
+      await log("info", `Texto: "${answer}"`);
 
-      if (data.type === "radio") {
-        await page.evaluate((idx) => {
-          const radios = Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"]'));
-          const target = radios[idx] as HTMLInputElement | undefined;
-          if (target) {
-            target.click();
-            target.checked = true;
-            target.dispatchEvent(new Event("change", { bubbles: true }));
-          }
-        }, chosenIdx);
-      } else {
-        await page.evaluate((idx) => {
-          const select = document.querySelector("select") as HTMLSelectElement | null;
-          if (select) {
-            const opts = Array.from(select.options).filter((o) => o.value !== "");
-            const target = opts[idx];
-            if (target) {
-              select.value = target.value;
-              select.dispatchEvent(new Event("change", { bubbles: true }));
-            }
-          }
-        }, chosenIdx);
-      }
+    } else if (data.type === "radio") {
+      const idx = pickBestOption(q, data.options);
+      await page.evaluate((idx) => {
+        const radios = Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"]'));
+        const t = radios[idx] as HTMLInputElement | undefined;
+        if (t) { t.click(); t.checked = true; t.dispatchEvent(new Event("change", { bubbles: true })); }
+      }, idx);
+      await log("info", `Radio[${idx}]: "${data.options[idx]}"`);
 
-      await log("info", `Resposta: "${data.questionText.slice(0, 40)}..." -> "${data.options[chosenIdx]}"`);
+    } else if (data.type === "select") {
+      const idx = pickBestOption(q, data.options);
+      await page.evaluate((idx) => {
+        const s = document.querySelector("select") as HTMLSelectElement | null;
+        if (s) {
+          const o = Array.from(s.options).filter((x) => x.value !== "")[idx];
+          if (o) { s.value = o.value; s.dispatchEvent(new Event("change", { bubbles: true })); }
+        }
+      }, idx);
+      await log("info", `Select[${idx}]: "${data.options[idx]}"`);
+
+    } else if (data.type === "scale-btn") {
+      // Pick ~70th percentile
+      const idx = Math.floor(data.options.length * 0.7);
+      await page.evaluate((val) => {
+        const btns = Array.from(document.querySelectorAll("button"));
+        const t = btns.find((b) => b.textContent?.trim() === val);
+        if (t) t.click();
+      }, data.options[idx]);
+      await log("info", `Escala: ${data.options[idx]}`);
+
+    } else if (data.type.startsWith("clickable:")) {
+      const sel = data.type.replace("clickable:", "");
+      const idx = pickBestOption(q, data.options);
+      const chosenText = data.options[idx];
+      await page.evaluate(({ sel, chosenText }) => {
+        const els = Array.from(document.querySelectorAll(sel));
+        const t = els.find((e) => e.textContent?.trim() === chosenText);
+        if (t) (t as HTMLElement).click();
+      }, { sel, chosenText });
+      await log("info", `Clicavel[${idx}]: "${chosenText}"`);
     }
 
-    await sleep(400);
+    await sleep(600);
 
-    // Click next/advance button
+    // ── Advance to next question ─────────────────────────────────────────────
     const advanced = await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll("button, input[type='submit']"));
+      const buttons = Array.from(document.querySelectorAll("button, input[type='submit'], a"));
       const next = buttons.find((b) => {
-        const t = (b.textContent ?? (b as HTMLInputElement).value ?? "").toLowerCase();
-        return t.match(/proxim|continuar|avançar|next|ok|confirmar|enviar|submit/);
+        const t = (b.textContent ?? (b as HTMLInputElement).value ?? "").toLowerCase().trim();
+        return /^(próximo|proximo|continuar|avançar|avancar|next|ok|confirmar|enviar|submit|ir|seguinte|responder|votar)$/.test(t)
+          || t.startsWith("próxim") || t.startsWith("proxim") || t.startsWith("continu");
       });
-      if (next) { (next as HTMLElement).click(); return true; }
+      if (next) { (next as HTMLElement).click(); return (next as HTMLElement).textContent?.trim() ?? "found"; }
 
       const submit = document.querySelector('button[type="submit"], input[type="submit"]');
-      if (submit) { (submit as HTMLElement).click(); return true; }
+      if (submit) { (submit as HTMLElement).click(); return "submit"; }
 
-      return false;
+      return null;
     });
 
-    if (!advanced) await log("warn", "Botao de avancar nao encontrado");
+    if (advanced) {
+      await log("info", `Avancu: "${advanced}"`);
+    } else {
+      await log("warn", "Botao de avancar nao encontrado");
+    }
 
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2000);
     return "answered";
-  } catch {
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await log("warn", `answerCurrentQuestion erro: ${msg.slice(0, 100)}`);
     return "no_question";
   }
 }
