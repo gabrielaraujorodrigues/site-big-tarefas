@@ -589,9 +589,14 @@ async function detectSurveys(page: Page): Promise<SurveyItem[]> {
         if (href === "/" || href === "/app" || href === "/app/" || href.includes("login") || href.includes("entrar")) continue;
         if (text.length < 3) continue;
 
-        // Must be under /app/ sub-route (not the app root itself)
-        const isSurveyLink = href.startsWith("/app/") && href !== "/app/" && href !== "/app";
-        if (!isSurveyLink) continue;
+        // Only accept specific survey pages: /app/surveys/{id}/ (not the list /app/surveys/)
+        // Exclude: /app/transactions/, /app/profile/, /app/rewards/, /app/embaixador/,
+        //          /app/pesquisas-cpx/, /app/surveys/ (bare list)
+        const EXCLUDED = ["/app/", "/app/surveys/", "/app/transactions/", "/app/profile/",
+          "/app/rewards/", "/app/embaixador/", "/app/pesquisas-cpx/"];
+        const isExcluded = EXCLUDED.includes(href) || EXCLUDED.includes(href + "/");
+        const isSurveyLink = href.startsWith("/app/surveys/") && href !== "/app/surveys/" && href !== "/app/surveys";
+        if (!isSurveyLink || isExcluded) continue;
 
         const fullText = a.closest("section, article, li, div[class*='card'], div[class*='item']")?.textContent?.trim() ?? text;
 
@@ -709,8 +714,48 @@ async function completeSurvey(page: Page, survey: SurveyItem): Promise<void> {
       return;
     }
 
+    // Wait for the survey landing page content to fully load (Next.js SPA)
+    await activePage.waitForFunction(
+      () => !document.body.innerText.includes("Carregando"),
+      { timeout: 12000 }
+    ).catch(() => {});
+    await sleep(2000);
+
+    // Log full landing page body for debugging
+    const landingBody = await activePage.evaluate(() => document.body.innerText.slice(0, 500)).catch(() => "");
+    await log("info", `Landing page: ${landingBody.slice(0, 300)}`);
+
+    // Click "Começar / Participar / Iniciar / Responder" button on landing page
+    const startClicked = await activePage.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll("a, button"));
+      const start = btns.find((b) => {
+        const t = (b.textContent ?? "").toLowerCase().trim();
+        return /^(começar|comecar|participar|iniciar|responder|start|entrar|ir para a pesquisa|abrir pesquisa|fazer pesquisa|acessar)/.test(t)
+          || t.includes("começar") || t.includes("participar") || t.includes("iniciar");
+      });
+      if (start) { (start as HTMLElement).click(); return (start as HTMLElement).textContent?.trim() ?? "ok"; }
+      return null;
+    });
+
+    if (startClicked) {
+      await log("info", `Botao inicio clicado: "${startClicked}"`);
+      // Listen for new tab from this click
+      const afterClickNewPage = activePage.context().waitForEvent("page", { timeout: 6000 }).catch(() => null);
+      await activePage.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => {});
+      await sleep(3000);
+      const afterNewTab = await afterClickNewPage;
+      if (afterNewTab && !afterNewTab.isClosed()) {
+        await afterNewTab.waitForLoadState("domcontentloaded").catch(() => {});
+        await sleep(2000);
+        await log("info", `Nova aba (inicio): ${afterNewTab.url()}`);
+        activePage = afterNewTab;
+      }
+      await log("info", `URL apos inicio: ${activePage.url()}`);
+    } else {
+      await log("info", "Nenhum botao de inicio encontrado — tentando responder diretamente");
+    }
+
     // Check for iframe that contains the survey
-    const iframeEl = activePage.frameLocator("iframe").first();
     const hasIframe = await activePage.locator("iframe").count() > 0;
     if (hasIframe) {
       await log("info", "Survey em iframe detectado");
