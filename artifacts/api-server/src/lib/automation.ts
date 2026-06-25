@@ -600,8 +600,9 @@ async function detectSurveys(page: Page): Promise<SurveyItem[]> {
 
         const fullText = a.closest("section, article, li, div[class*='card'], div[class*='item']")?.textContent?.trim() ?? text;
 
-        // Extract points from surrounding container
-        const pointsMatch = fullText.match(/\+?\s*(\d+)\s*(?:BigPontos?|pontos?|pts)/i);
+        // Extract points — handles "+100", "+100 BigPontos", "100 pts", etc.
+        const pointsMatch = fullText.match(/\+\s*(\d+)\s*(?:BigPontos?|pontos?|pts)?/i)
+          ?? fullText.match(/(\d+)\s*(?:BigPontos?|pontos?|pts)/i);
         const points = pointsMatch ? parseInt(pointsMatch[1], 10) : 0;
 
         // Extract best title: prefer heading inside card, fallback to link text
@@ -632,7 +633,8 @@ async function detectSurveys(page: Page): Promise<SurveyItem[]> {
           const href = innerLink?.getAttribute("href") ?? "";
           const fullHref = href.startsWith("http") ? href : href ? base + href : "";
 
-          const pointsMatch = text.match(/\+?\s*(\d+)\s*(?:BigPontos?|pontos?|pts)/i);
+          const pointsMatch = text.match(/\+\s*(\d+)\s*(?:BigPontos?|pontos?|pts)?/i)
+            ?? text.match(/(\d+)\s*(?:BigPontos?|pontos?|pts)/i);
           const points = pointsMatch ? parseInt(pointsMatch[1], 10) : 0;
 
           const headingEl = card.querySelector("h1,h2,h3,h4,strong,p");
@@ -929,17 +931,28 @@ async function answerCurrentQuestion(page: Page): Promise<"answered" | "done" | 
         return { isDone: false, questionText, options: selectOptions, type: "select", optionEls: [] };
       }
 
+      // ── Text input (check BEFORE clickable buttons — CEP, name, number fields) ──
+      const textInput = document.querySelector(
+        'input[type="text"], input[type="number"], input[type="tel"], input[inputmode="numeric"], input[inputmode="text"], textarea'
+      );
+      if (textInput) return { isDone: false, questionText, options: [], type: "text", optionEls: [] };
+
       // ── Styled button/div options (common in mobile survey apps) ────────────
-      // Look for a list of clickable options that aren't navigation buttons
+      // Navigation words to exclude from option lists
+      const NAV_WORDS = ["próximo", "proximo", "voltar", "anterior", "back", "next", "cancelar", "sair", "fechar"];
+      const isNavBtn = (t: string) => NAV_WORDS.some((w) => t.toLowerCase().includes(w));
+
       const clickableGroups = [
         '[class*="option"]', '[class*="choice"]', '[class*="alternativa"]',
-        '[class*="answer"]', '[class*="resposta"]', '[class*="item"]',
+        '[class*="answer"]', '[class*="resposta"]',
         'li[class]', 'div[role="option"]', 'div[role="radio"]',
-        'button:not([type="submit"]):not([class*="next"]):not([class*="avanc"])',
+        'button:not([type="submit"])',
       ];
       for (const sel of clickableGroups) {
         const els = Array.from(document.querySelectorAll(sel));
-        const texts = els.map((e) => e.textContent?.trim() ?? "").filter((t) => t.length > 0 && t.length < 150);
+        const texts = els
+          .map((e) => e.textContent?.trim() ?? "")
+          .filter((t) => t.length > 1 && t.length < 150 && !isNavBtn(t));
         // Must have at least 2 options and no more than 10
         if (texts.length >= 2 && texts.length <= 10) {
           return { isDone: false, questionText, options: texts, type: "clickable:" + sel, optionEls: [] };
@@ -954,9 +967,7 @@ async function answerCurrentQuestion(page: Page): Promise<"answered" | "done" | 
         return { isDone: false, questionText, options: nums.map(String), type: "scale-btn", optionEls: [] };
       }
 
-      // ── Text input ──────────────────────────────────────────────────────────
-      const textInput = document.querySelector('input[type="text"], input[type="number"], textarea');
-      if (textInput) return { isDone: false, questionText, options: [], type: "text", optionEls: [] };
+      // (text input already checked above, before clickable buttons)
 
       return { isDone: false, questionText: "", options: [], type: "none", optionEls: [] };
     });
@@ -1039,7 +1050,8 @@ async function answerCurrentQuestion(page: Page): Promise<"answered" | "done" | 
       await log("warn", "Botao de avancar nao encontrado");
     }
 
-    await page.waitForTimeout(2000);
+    // Wait longer for page animation/transition between questions
+    await page.waitForTimeout(3500);
     return "answered";
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
