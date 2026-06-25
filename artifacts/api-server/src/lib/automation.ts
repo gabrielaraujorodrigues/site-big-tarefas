@@ -763,6 +763,29 @@ async function completeSurvey(page: Page, survey: SurveyItem): Promise<void> {
       await log("info", "Survey em iframe detectado");
     }
 
+    // Save full HTML for debugging (first 6000 chars)
+    const surveyHtmlFull = await activePage.evaluate(() => document.body.innerHTML.slice(0, 6000)).catch(() => "");
+    try { require("fs").writeFileSync("/tmp/bigpesquisa-survey-full.html", surveyHtmlFull); } catch {}
+
+    // Wait for actual survey question content to appear (not just the app shell header)
+    // Strategy: wait until there's meaningful non-header text (> 100 chars outside header/nav)
+    await activePage.waitForFunction(
+      () => {
+        const mainEl = document.querySelector("main, [class*='main'], [id*='main'], [class*='content'], form");
+        if (mainEl && (mainEl.textContent?.trim().length ?? 0) > 20) return true;
+        // Fallback: body has substantial text beyond just the header
+        const bodyText = document.body.innerText ?? "";
+        const lines = bodyText.split("\n").map(l => l.trim()).filter(l => l.length > 5);
+        return lines.length > 5;
+      },
+      { timeout: 12000 }
+    ).catch(() => {});
+    await sleep(2000);
+
+    // Log what we see now
+    const surveyBodyPreview = await activePage.evaluate(() => document.body.innerText?.slice(0, 600) ?? "").catch(() => "");
+    await log("info", `Survey body: ${surveyBodyPreview.slice(0, 400)}`);
+
     // Answer all questions
     let questionCount = 0;
     const MAX_QUESTIONS = 80;
@@ -887,19 +910,23 @@ async function answerCurrentQuestion(page: Page): Promise<"answered" | "done" | 
       // ── Question text ───────────────────────────────────────────────────────
       let questionText = "";
       const questionSelectors = [
-        "legend", "h1", "h2", "h3", "h4",
+        "legend",
         "[class*='question']", "[class*='pergunta']", "[class*='titulo']",
-        "[class*='title']", "[class*='prompt']", "[class*='enunciado']",
-        "p[class*='text']", "span[class*='question']",
+        "[class*='prompt']", "[class*='enunciado']",
         "label.title", "p.question",
-        // broad fallback: first <p> or <span> with a question mark or long text
+        "h1", "h2", "h3", "h4",
         "p", "span",
       ];
       for (const sel of questionSelectors) {
         const els = Array.from(document.querySelectorAll(sel));
         for (const el of els) {
+          // Skip elements inside app chrome (header, nav, footer)
+          if (el.closest("header, nav, footer, [class*='header'], [class*='nav'], [class*='bottom-nav'], [class*='topbar']")) continue;
+          // Skip style/script content
+          if (el.closest("style, script, noscript")) continue;
           const t = el.textContent?.trim() ?? "";
-          if (t.length > 10 && t.length < 400) {
+          // Must look like a real question (meaningful length, not a nav label)
+          if (t.length > 8 && t.length < 500) {
             questionText = t;
             break;
           }
